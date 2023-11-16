@@ -9,10 +9,22 @@ use x11::xlib::{
   XMapRaised,
   XClearWindow,
   XGCValues,
-  XSync,
+//  XSync,
   XUnmapWindow,
+  XDestroyWindow,
   XFreeGC,
-  XCloseDisplay
+  XCloseDisplay,
+  XSetWindowBorder,
+  XSetWindowBackground,
+  XNextEvent,
+  XEvent,
+  XSelectInput,
+  ExposureMask,
+  KeyPress,
+  KeyPressMask,
+  KeyRelease,
+  KeyReleaseMask,
+  ButtonPressMask
 };
 
 struct GCV {
@@ -57,14 +69,8 @@ impl GCV {
   }
 }
 
-struct GC {
-  gc: x11::xlib::GC
-}
-
 struct Display {
-  display: *mut x11::xlib::Display,
-  gcs: Vec<GC>,
-  gcvs: Vec<GCV>
+  display: *mut x11::xlib::Display
 }
 
 impl Display {
@@ -81,21 +87,8 @@ impl Display {
     }
     else {
       Ok(Display {
-        display: display,
-	gcs: Vec::new(),
-	gcvs: Vec::new()
+        display: display
       })
-    }
-  }
-
-  unsafe fn gc(&mut self, window: u64, gcv: GCV) -> GC {
-    let gc = XCreateGC(self.display, window, gcv.flags, gcv.as_ptr());
-
-    self.gcs.push(GC { gc });
-    self.gcvs.push(gcv);
-
-    GC {
-      gc: gc
     }
   }
 }
@@ -103,13 +96,92 @@ impl Display {
 impl Drop for Display {
   fn drop(&mut self) {
     unsafe {
-      if !self.display.is_null() {
-	for gc in self.gcs.iter() {
-	  XFreeGC(self.display, gc.gc);
-	}
-        XCloseDisplay(self.display);
-      }
+      XCloseDisplay(self.display);
     }
+  }
+}
+
+struct Window<'a> {
+  window: u64,
+  display: &'a Display,
+  gc: x11::xlib::GC
+}
+
+impl<'a> Window<'a> {
+  unsafe fn new(display: &'a Display, gcv: GCV) -> Result<Window<'a>, &'static str> {
+    let root = XDefaultRootWindow(display.display);
+    let window = XCreateSimpleWindow(
+      display.display,
+      root,
+      0, 0,
+      200, 100,
+      0,
+      0,
+      0
+    );
+    let gc = XCreateGC(display.display, window, gcv.flags, gcv.as_ptr());
+    if gc.is_null() {
+      XDestroyWindow(display.display, window);
+      return Err("Failed to create GC");
+    }
+
+    XSetWindowBorder(display.display, window, 0x00ff0000);
+    XSetWindowBackground(display.display, window, 0x0000ff00);
+    XClearWindow(display.display, window);
+
+    Ok(Window {
+      window: window,
+      display: display,
+      gc: gc
+    })
+  }
+
+  unsafe fn map(&self) {
+    XMapRaised(self.display.display, self.window);
+  }
+}
+
+impl<'a> Drop for Window<'a> {
+  fn drop(&mut self) {
+    unsafe {
+      XFreeGC(self.display.display, self.gc);
+      XUnmapWindow(self.display.display, self.window);
+      XDestroyWindow(self.display.display, self.window);
+    }
+  }
+}
+
+struct Event<'a> {
+  event: XEvent,
+  display: &'a Display,
+  window: &'a Window<'a>
+}
+
+impl<'a> Event<'a> {
+  fn new(display: &'a Display, window: &'a Window) -> Event<'a> {
+    Event {
+      event: XEvent {
+	type_: 0
+      },
+      display: display,
+      window: window
+    }
+  }
+
+  unsafe fn next<F>(&mut self, display: &Display, mut f: F) where
+      F: FnMut(&XEvent)
+  {
+    XNextEvent(display.display, &mut self.event);
+    (f)(&self.event);
+  }
+
+  unsafe fn select_input(&mut self) {
+    XSelectInput(self.display.display, self.window.window,
+      ExposureMask     |
+      KeyPressMask     |
+      KeyReleaseMask   |
+      ButtonPressMask
+    );
   }
 }
 
@@ -121,31 +193,52 @@ fn main() {
   println!("Hello, world! {}", a);
 
   unsafe {
-    let mut display = Display::new(None).unwrap_or_else(|e| {
+    let display = Display::new(None).unwrap_or_else(|e| {
       eprintln!("{}", e);
       std::process::exit(1);
     });
 
-    let screen = XDefaultScreen(display.display);
-    let root = XDefaultRootWindow(display.display);
-    let window = XCreateSimpleWindow(
-      display.display,
-      root,
-      0, 0,
-      200, 100,
-      0,
-      0,
-      0
-    );
+    let _screen = XDefaultScreen(display.display);
+    let window = Window::new(&display, GCV::new()).unwrap_or_else(|e| {
+      eprintln!("{}", e);
+      std::process::exit(1);
+    });
 
     // XSelectInput for later
+    // Set border and background of window like this:
 
-    let gc = display.gc(window, GCV::new());
+    window.map();
+//    XSync(display.display, 0);
 
-    XClearWindow(display.display, window);
-    XMapRaised(display.display, window);
-    XSync(display.display, 0);
-    std::thread::sleep(std::time::Duration::from_secs(5));
-    XUnmapWindow(display.display, window);
+    let mut ctrl = false;
+    let mut running = true;
+
+    let mut event = Event::new(&display, &window);
+
+    event.select_input();
+
+    // Start event loop here
+    while running {
+      event.next(&display, |e| {
+        println!("Event type {}", e.type_);
+        // Catch Q key
+        if e.type_ == KeyPress {
+          println!("Key {} pressed", e.key.keycode);
+          match e.key.keycode {
+            24 => running = false,             // Q
+	    54 => if ctrl { running = false }, // C
+	    37 => ctrl = true,                 // Ctrl
+             _ => {}
+          }
+        }
+        else if e.type_ == KeyRelease {
+	  println!("Key {} released", e.key.keycode);
+	  match e.key.keycode {
+	    37 => ctrl = false,                // Ctrl
+	    _ => {}
+	  }
+	}
+      });
+    }
   }
 }
