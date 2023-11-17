@@ -23,9 +23,15 @@ use x11::xlib::{
   KeyPressMask,
   KeyRelease,
   KeyReleaseMask,
-  ButtonPressMask
+  ButtonPressMask,
+  XDrawLine,
+//  GCForeground,
+//  GCLineWidth,
+  XSync,
+  XFlush
 };
 
+#[derive(Clone)]
 pub struct GCV {
   flags: u64,
   gcv: Box<XGCValues>
@@ -34,13 +40,14 @@ pub struct GCV {
 impl GCV {
   pub fn new() -> GCV {
     GCV {
+      //flags: (GCForeground | GCLineWidth) as u64,
       flags: 0,
       gcv: Box::new(XGCValues {
 	function: 0,
 	plane_mask: 0,
 	foreground: 0,
 	background: 0,
-	line_width: 0,
+	line_width: 10,
 	line_style: 0,
 	cap_style: 0,
 	join_style: 0,
@@ -65,6 +72,34 @@ impl GCV {
 
   fn as_ptr(&self) -> *mut XGCValues {
     &*self.gcv as *const XGCValues as *mut XGCValues
+  }
+}
+
+struct GC<'a> {
+  gc: x11::xlib::GC,
+  display: &'a Display
+}
+
+impl<'a> GC<'a> {
+  fn new(display: &'a Display, window: &'a Window, gcv: &GCV) -> Result<GC<'a>, &'static str> {
+    let gc: x11::xlib::GC;
+    unsafe {
+      gc = XCreateGC(display.display, window.window, gcv.flags, gcv.as_ptr());
+    }
+    if gc.is_null() {
+      Err("Failed to create GC")
+    }
+    else {
+      Ok(GC { gc, display })
+    }
+  }
+}
+
+impl<'a> Drop for GC<'a> {
+  fn drop(&mut self) {
+    unsafe {
+      XFreeGC(self.display.display, self.gc);
+    }
   }
 }
 
@@ -94,6 +129,18 @@ impl Display {
       })
     }
   }
+
+  pub fn sync(&self) {
+    unsafe {
+      XSync(self.display, 0);
+    }
+  }
+
+  pub fn flush(&self) {
+    unsafe {
+      XFlush(self.display);
+    }
+  }
 }
 
 impl Drop for Display {
@@ -104,17 +151,53 @@ impl Drop for Display {
   }
 }
 
+pub trait Shape {
+  fn draw(&self);
+}
+
+pub struct Line<'a> {
+  x1: i32,
+  y1: i32,
+  x2: i32,
+  y2: i32,
+  gc: GC<'a>,
+  display: &'a Display,
+  window: &'a Window<'a>
+}
+
+impl<'a> Line<'a> {
+  pub fn new(display: &'a Display, window: &'a Window, x1: i32, y1: i32, x2: i32, y2: i32, gcv: &GCV)
+    -> Result<Line<'a>, &'static str> {
+    Ok(Line {
+      x1: x1,
+      y1: y1,
+      x2: x2,
+      y2: y2,
+      // TODO : Try to handle error
+      gc: GC::new(display, window, gcv).unwrap(),
+      display: display,
+      window: window
+    })
+  }
+}
+
+impl<'a> Shape for Line<'a> {
+  fn draw(&self) {
+    unsafe {
+      XDrawLine(self.display.display, self.window.window, self.gc.gc, self.x1, self.y1, self.x2, self.y2);
+    }
+  }
+}
+
 pub struct Window<'a> {
   window: u64,
-  display: &'a Display,
-  gc: x11::xlib::GC
+  display: &'a Display
 }
 
 impl<'a> Window<'a> {
-  pub fn new(display: &'a Display, gcv: GCV) -> Result<Window<'a>, &'static str> {
+  pub fn new(display: &'a Display) -> Result<Window<'a>, &'static str> {
     let root: u64;
     let window: u64;
-    let gc: x11::xlib::GC;
     
     unsafe {
       root = XDefaultRootWindow(display.display);
@@ -128,13 +211,6 @@ impl<'a> Window<'a> {
 	0
       );
 
-      gc = XCreateGC(display.display, window, gcv.flags, gcv.as_ptr());
-
-      if gc.is_null() {
-	XDestroyWindow(display.display, window);
-	return Err("Failed to create GC");
-      }
-
       XSetWindowBorder(display.display, window, 0x00ff0000);
       XSetWindowBackground(display.display, window, 0x0000ff00);
       XClearWindow(display.display, window);
@@ -142,8 +218,7 @@ impl<'a> Window<'a> {
 
     Ok(Window {
       window: window,
-      display: display,
-      gc: gc
+      display: display
     })
   }
 
@@ -157,7 +232,6 @@ impl<'a> Window<'a> {
 impl<'a> Drop for Window<'a> {
   fn drop(&mut self) {
     unsafe {
-      XFreeGC(self.display.display, self.gc);
       XUnmapWindow(self.display.display, self.window);
       XDestroyWindow(self.display.display, self.window);
     }
